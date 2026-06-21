@@ -2,10 +2,10 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+.env
 # C extensions
 *.so
-
+flink-env/
 # Distribution / packaging
 .Python
 build/
