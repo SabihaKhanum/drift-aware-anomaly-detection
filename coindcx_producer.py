@@ -1,14 +1,11 @@
-import os
+import websocket
 import json
-import time
-import math
-import random
 from datetime import datetime, timezone
-from dotenv import load_dotenv
 from kafka import KafkaProducer
+from dotenv import load_dotenv
+import os
 
 load_dotenv()
-print("***** PRODUCER FILE EXECUTING *****")
 
 producer = KafkaProducer(
     bootstrap_servers=os.getenv("CONFLUENT_BOOTSTRAP"),
@@ -19,40 +16,36 @@ producer = KafkaProducer(
     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
 )
 
-TOPIC = "mcx-crude-prices"
-print(f"Starting producer. Topic = {TOPIC}")
+# TOPIC = "mcx-crude-prices"
+TOPIC = "binance-btcusdt"
 
-t = 0
-
-while True:
-    t += 1
-
-    # Normal regime — oscillating price with noise
-    price = 6500 + 50 * math.sin(t / 10) + random.gauss(0, 20)
-
-    # Sudden drift at tick 100 — sharp jump
-    if t == 100:
-        price += 500
-        print("*** SUDDEN DRIFT INJECTED at tick 100 ***")
-
-    # Gradual drift after tick 200 — slow upward creep
-    if t > 200:
-        price += (t - 200) * 0.5
-
-    # Recurring drift — periodic shock every 300 ticks
-    if t % 300 == 0:
-        price += random.choice([-300, 300])
-        print(f"*** RECURRING DRIFT INJECTED at tick {t} ***")
-
+def on_message(ws, message):
+    data = json.loads(message)
     tick = {
-        "symbol": "CRUDEOIL",
-        "price": round(price, 2),
-        "volume": round(random.uniform(80, 120), 2),
+        "symbol": data["s"],
+        "price": float(data["c"]),
+        "volume": float(data["v"]),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
-
     producer.send(TOPIC, value=tick)
     producer.flush()
-    print(f"Tick {t}: Sent price {tick['price']}")
+    print(f"Live: {tick['symbol']} @ {tick['price']}")
 
-    time.sleep(1)
+def on_error(ws, error):
+    print(f"Error: {error}")
+
+def on_close(ws, code, msg):
+    print("Closed")
+
+def on_open(ws):
+    print("Connected to Binance WebSocket")
+
+if __name__ == "__main__":
+    ws = websocket.WebSocketApp(
+        "wss://stream.binance.com:9443/ws/btcusdt@ticker",
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+    )
+    ws.run_forever()

@@ -17,7 +17,7 @@ conn = psycopg2.connect(
 cur = conn.cursor()
 
 consumer = KafkaConsumer(
-    "mcx-crude-prices",
+    "binance-btcusdt",
     bootstrap_servers=os.getenv("CONFLUENT_BOOTSTRAP"),
     security_protocol="SASL_SSL",
     sasl_mechanism="PLAIN",
