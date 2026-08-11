@@ -115,9 +115,8 @@ log.info("Database ready")
 class RollingStats:
     """
     Tracks rolling statistics over short and long windows.
-    Operates on whatever series it's fed (price_return, or a smoothed
-    variant of it) so vol_ratio and z_score are scale-invariant relative
-    to that series.
+    Operates on price_return (% change) not raw price,
+    so vol_ratio and z_score are scale-invariant.
     """
     def __init__(self, short_window=60, long_window=500):
         self.short = deque(maxlen=short_window)
@@ -125,7 +124,7 @@ class RollingStats:
         self.drift_signals = deque(maxlen=20)
 
     def update(self, value, drift_signal: bool):
-        # value should be price_return (or smoothed_return), not raw price
+        # value should be price_return, not raw price
         self.short.append(value)
         self.long.append(value)
         self.drift_signals.append(1 if drift_signal else 0)
@@ -180,38 +179,28 @@ def classify_severity(stats: RollingStats, value: float, adwin_width: int) -> st
 class CUSUM:
     """
     Two-sided CUSUM on % price returns, scaled by an EXTERNAL, stable
-    baseline standard deviation, given each tick via `set_baseline_std`.
+    baseline standard deviation of returns (not its own recent history).
 
     FIX HISTORY:
     1) Originally `drift_param`/`threshold` were fixed absolute percentage
-       values (0.5, 5.0) — CUSUM could never accumulate past zero.
-    2) Scaling by CUSUM's own short internal history became a moving
-       goalpost that ran away from genuine drift.
-    3) Scaling by RollingStats.baseline_vol on RAW price_return, while
-       CUSUM's actual input was EMA-smoothed, made k/h chronically
-       oversized relative to what CUSUM was accumulating — fixed by
-       scaling against baseline std of the SAME smoothed series
-       (see cusum_stats in the main loop).
-    4) Even with (3) fixed, adapt_intraday() was hard-resetting
-       cusum_pos/cusum_neg to 0 on every SOFT_ADAPT dispatch — which
-       fires on essentially every confirmed drift that isn't big enough
-       to be REGIME_SHIFT/CRISIS. Since a real sustained move gets
-       confirmed by ADWIN/PageHinkley well before it's large enough to
-       clear those higher bars, CUSUM's accumulator was being wiped out
-       mid-accumulation, every time, before it could ever cross h.
-       FIX: adapt_intraday() now only widens h_multiplier (making CUSUM
-       *harder* to trip on genuine noise) and leaves cusum_pos/cusum_neg
-       untouched. Only adapt_regime()/adapt_crisis_freeze()/
-       adapt_crisis_recover() reset the accumulator now, since those are
-       the cases where the prior baseline is actually known to be stale.
-    5) The mean warm-up never ran past tick 1: `self.mean` was being set
-       inside the `len(self.history) < 10` branch itself, so on the very
-       next call `self.mean is None` was already False and the intended
-       "average the first 10 ticks" step was skipped — it anchored on
-       whatever `self.mean` was after tick 1 only. Fixed below so `mean`
-       is left unset until 10 ticks have actually accumulated.
-        slack     = k_multiplier * baseline_std(smoothed_return)
-        threshold = h_multiplier * baseline_std(smoothed_return)
+       values (0.5, 5.0), but tick-to-tick BTC returns are ~0.001%-0.05% —
+       10-500x smaller — so CUSUM could never accumulate past zero.
+    2) Scaling by CUSUM's own short internal history fixed (1), but
+       introduced a new problem: during a real, sustained move, that same
+       short window becomes contaminated by the move itself, so `std`
+       inflates in lockstep with the signal CUSUM is supposed to detect.
+       The threshold becomes a moving goalpost that runs away from genuine
+       drift — a real ~1.5% rally in BTC still got graded against a
+       just-as-elevated local std and CUSUM stayed flat.
+
+    THE FIX: CUSUM no longer computes its own std. It's given an external,
+    longer-horizon baseline std each tick (via `set_baseline_std`) — in this
+    pipeline, RollingStats.baseline_vol, the 500-tick window. A 500-tick
+    baseline is diluted by far more "normal" history than a 20-30 tick
+    window, so it doesn't run away the instant a real move starts, and a
+    genuine sustained shift can actually cross k/h multiples of it.
+        slack     = k_multiplier * baseline_std
+        threshold = h_multiplier * baseline_std
     """
     def __init__(self, k_multiplier=0.5, h_multiplier=5.0, min_std=1e-6, history_len=100):
         self.k_multiplier    = k_multiplier
@@ -227,8 +216,8 @@ class CUSUM:
 
     def set_baseline_std(self, baseline_std: float):
         """Called once per tick with a stable, longer-horizon volatility
-        estimate of the SAME series CUSUM.update() will be called with
-        (i.e. baseline std of smoothed_return, not raw price_return)."""
+        estimate (e.g. RollingStats.baseline_vol) so CUSUM's own threshold
+        doesn't get contaminated by the very move it's trying to detect."""
         self.baseline_std = max(float(baseline_std), self.min_std)
 
     def update(self, value):
@@ -237,12 +226,13 @@ class CUSUM:
 
         self.history.append(value)
 
-        # Warm-up: don't set self.mean until we actually have 10 ticks.
-        # (Fix 5 — previously self.mean got set on tick 1, so this branch
-        # was never entered again after the very first call.)
-        if self.mean is None and len(self.history) < 10:
-            return False, 0.0
         if self.mean is None:
+            # Warm up the reference mean over the first few ticks, then
+            # freeze it — it must NOT be recalculated every tick, or it
+            # chases the very drift it's supposed to detect (see docstring).
+            if len(self.history) < 10:
+                self.mean = float(np.mean(self.history))
+                return False, 0.0
             self.mean = float(np.mean(self.history))
 
         std = self.baseline_std
@@ -254,22 +244,24 @@ class CUSUM:
         self.cusum_neg = max(0.0, self.cusum_neg - deviation - k)
 
         is_anomaly = self.cusum_pos > h or self.cusum_neg > h
-        # self.mean is intentionally NOT updated here — only during
-        # adapt_regime()/adapt_crisis_recover(), after drift is confirmed
-        # to be a real regime change. See docstring.
+        # NOTE: self.mean is intentionally NOT updated here. It only moves
+        # during adapt_regime()/adapt_intraday()/adapt_crisis_recover(),
+        # i.e. after a drift has actually been confirmed. Recalculating it
+        # every tick (the previous bug) made CUSUM compare each value to the
+        # rolling average of its own recent window — which drifts along with
+        # any real trend, permanently masking sustained drift as "no change."
 
+        # Normalize score by h so it's on a comparable ~0-1+ scale to the
+        # other detectors instead of raw cusum units.
         raw_score = max(self.cusum_pos, self.cusum_neg)
         score     = raw_score / max(h, 1e-9)
         return is_anomaly, score
 
     def adapt_intraday(self):
-        # Fix 4: widen the threshold only. Do NOT reset cusum_pos/cusum_neg
-        # here — SOFT_ADAPT fires on nearly every confirmed drift that isn't
-        # big enough to be REGIME_SHIFT/CRISIS, so resetting on every call
-        # wipes out accumulation during the very sustained move CUSUM is
-        # trying to detect, before it can ever cross h.
+        self.cusum_pos    = 0.0
+        self.cusum_neg    = 0.0
         self.h_multiplier = self.baseline_h * INTRADAY_CUSUM_WIDEN_FACTOR
-        log.info("CUSUM soft adapt — h_multiplier widened to %.2f (accumulator preserved)", self.h_multiplier)
+        log.info("CUSUM soft adapt — h_multiplier widened to %.2f", self.h_multiplier)
 
     def adapt_regime(self):
         if len(self.history) > 10:
@@ -309,10 +301,6 @@ class EMA:
     averages toward ~0). ADWIN/PageHinkley/HST are left on the raw series
     since they don't rely on directional accumulation and are already
     reacting correctly to the raw ticks.
-
-    IMPORTANT: because this smoothing shrinks variance relative to raw
-    price_return, CUSUM's baseline std must ALSO be computed on this
-    smoothed series (see CUSUM docstring, fix 3) — never on raw returns.
     """
     def __init__(self, span=5):
         self.alpha = 2.0 / (span + 1.0)
@@ -402,16 +390,7 @@ iso_forest = AdaptiveIsolationForest(
     window_size=ISO_WINDOW, min_train=ISO_MIN_TRAIN,
     threshold=ISO_THRESHOLD, contamination=ISO_CONTAMINATION
 )
-
-# `stats` tracks RAW price_return — used by ADWIN/PageHinkley severity
-# classification (vol_ratio, z_score, drift_rate), where raw variance is
-# exactly what's wanted.
-stats        = RollingStats(short_window=VOL_WINDOW, long_window=BASELINE_VOL_WINDOW)
-
-# `cusum_stats` tracks the SMOOTHED series CUSUM actually consumes, so its
-# baseline std is on the same scale as CUSUM's input (see CUSUM docstring,
-# fix 3 / EMA docstring). This is the core fix for the flat-CUSUM bug.
-cusum_stats  = RollingStats(short_window=VOL_WINDOW, long_window=BASELINE_VOL_WINDOW)
+stats      = RollingStats(short_window=VOL_WINDOW, long_window=BASELINE_VOL_WINDOW)
 
 # ─── Crisis state ─────────────────────────────────────────────────────────────
 crisis_state = {"active": False, "onset_time": None, "stable_count": 0}
@@ -572,26 +551,17 @@ for msg in consumer:
 
     # ── Anomaly detection ─────────────────────────────────────────────────────
     # CUSUM    — EMA-smoothed price_return (span=CUSUM_EMA_SPAN), scaled by
-    #            cusum_stats' long-window (500-tick) baseline_vol OF THE
-    #            SAME SMOOTHED SERIES (this is the fix — previously scaled
-    #            by the raw-return baseline, which is systematically larger
-    #            than the smoothed series' own variance, so CUSUM's k/h
-    #            were oversized and it never accumulated past threshold).
+    #            RollingStats' long-window (500-tick) baseline_vol. Smoothing
+    #            is necessary because raw tick-to-tick alternation (flicker)
+    #            cancels out same-tick before CUSUM's directional accumulation
+    #            can build up — see EMA class docstring above.
     # ISO      — raw price, batch model handles absolute values fine
     # HST      — raw price_return, online model, scale-invariant, unaffected
     #            by alternation since it doesn't rely on directional runs
 
     smoothed_return = cusum_ema.update(price_return)
-    cusum_stats.update(smoothed_return, drift_signal=False)
-    cusum.set_baseline_std(cusum_stats.baseline_vol)
+    cusum.set_baseline_std(stats.baseline_vol)
     cusum_anomaly, cusum_score = cusum.update(smoothed_return)
-
-    if total_ticks % 10 == 0:
-        log.info("CUSUM debug: mean=%.6f std=%.6f k=%.6f h=%.6f pos=%.6f neg=%.6f smoothed=%.6f",
-                cusum.mean or 0.0, cusum.baseline_std,
-                cusum.k_multiplier * cusum.baseline_std,
-                cusum.h_multiplier * cusum.baseline_std,
-                cusum.cusum_pos, cusum.cusum_neg, smoothed_return)
 
     iso_anomaly, iso_score = iso_forest.update(price)
 
