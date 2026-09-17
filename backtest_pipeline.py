@@ -698,7 +698,7 @@ if not BACKTEST_CSV_PATH or not os.path.exists(BACKTEST_CSV_PATH):
     sys.exit(1)
 
 ADAPTIVE_MODE = os.getenv("ADAPTIVE_MODE", "true").lower() == "true"
-COMMIT_EVERY  = int(os.getenv("BACKTEST_COMMIT_EVERY", "500"))  # batch commits for speed
+COMMIT_EVERY  = int(os.getenv("BACKTEST_COMMIT_EVERY", "50"))  # batch commits for speed
 SYMBOL        = os.getenv("BACKTEST_SYMBOL", "BTCUSDT")
 
 log.info("Backtest mode: %s | source=%s", "ADAPTIVE" if ADAPTIVE_MODE else "STATIC BASELINE", BACKTEST_CSV_PATH)
@@ -725,6 +725,9 @@ CRISIS_RECOVERY_STABLE_COUNT  = int(os.getenv("CRISIS_RECOVERY_STABLE_COUNT", "3
 CRISIS_RECOVERY_VOL_RATIO     = float(os.getenv("CRISIS_RECOVERY_VOL_RATIO", "1.5"))
 INTRADAY_CUSUM_WIDEN_FACTOR   = float(os.getenv("INTRADAY_CUSUM_WIDEN_FACTOR", "1.2"))
 CUSUM_EMA_SPAN                = int(os.getenv("CUSUM_EMA_SPAN", "5"))
+HST_CALIB_LEN = 150
+hst_calib_scores = []
+hst_calibrated = False
 
 
 # ─── Database ─────────────────────────────────────────────────────────────────
@@ -894,6 +897,15 @@ class CUSUM:
             self.cusum_pos    = 0.0
             self.cusum_neg    = 0.0
             self.h_multiplier = self.baseline_h
+    # def adapt_regime(self):
+    #     if len(self.window) >= self.min_train:
+    #         self._train()
+    #         # re-derive threshold from the freshly retrained model's own
+    #         # score distribution on its current window, so the cutoff
+    #         # tracks the data instead of staying pinned to the original
+    #         # calm-period calibration
+    #         scores = self.model.score_samples(list(self.window))
+    #         self.threshold = float(np.percentile(scores, 1))
 
     def adapt_crisis_freeze(self):
         self.frozen = True
@@ -976,12 +988,25 @@ BINANCE_KLINES_COLUMNS = [
 # literally named "19414.02"). Detect this: if every "column name" parses
 # as a number, the file has no real header, so reload with header=None and
 # assign the known Binance klines column order explicitly.
+# def _looks_numeric(x):
+#     try:
+#         float(x)
+#         return True
+#     except (TypeError, ValueError):
+#         return False
+
 def _looks_numeric(x):
+    """Check if a string looks like a number, handling scientific notation."""
     try:
         float(x)
         return True
     except (TypeError, ValueError):
-        return False
+        # Lenient check: if it starts with a digit or contains 'E'/'e', treat as numeric
+        return isinstance(x, str) and (x[0].isdigit() or 'e' in x.lower())
+
+if all(_looks_numeric(c) for c in df.columns) and len(df.columns) == len(BINANCE_KLINES_COLUMNS):
+    log.info("Detected headerless Binance klines format -- reloading with standard column names.")
+    df = pd.read_csv(BACKTEST_CSV_PATH, header=None, names=BINANCE_KLINES_COLUMNS)
 
 if all(_looks_numeric(c) for c in df.columns) and len(df.columns) == len(BINANCE_KLINES_COLUMNS):
     log.info("Detected headerless Binance klines format -- reloading with standard column names.")
@@ -1065,22 +1090,40 @@ def check_crisis_recovery(stats, cusum, iso_forest, crisis_state):
     return False
 
 
+# def flush_inserts(cur, conn, inserts_buffer):
+#     """
+#     Batch-write everything accumulated in inserts_buffer using
+#     psycopg2.extras.execute_batch, grouped by SQL template. This turns
+#     N single-row round trips into ~len(distinct SQL templates) batched
+#     round trips per flush, instead of one execute() per row (which was
+#     the actual bottleneck -- deferring commit() alone does not batch
+#     the network round trips, only the transaction boundary).
+#     """
+#     if not inserts_buffer:
+#         return
+#     grouped = defaultdict(list)
+#     for sql, params in inserts_buffer:
+#         grouped[sql].append(params)
+#     for sql, param_list in grouped.items():
+#         execute_batch(cur, sql, param_list, page_size=500)
+#     conn.commit()
 def flush_inserts(cur, conn, inserts_buffer):
     """
-    Batch-write everything accumulated in inserts_buffer using
-    psycopg2.extras.execute_batch, grouped by SQL template. This turns
-    N single-row round trips into ~len(distinct SQL templates) batched
-    round trips per flush, instead of one execute() per row (which was
-    the actual bottleneck -- deferring commit() alone does not batch
-    the network round trips, only the transaction boundary).
+    Single-insert fallback: write one row at a time instead of batching.
+    Slower but won't crash the DB.
     """
     if not inserts_buffer:
         return
-    grouped = defaultdict(list)
+    
     for sql, params in inserts_buffer:
-        grouped[sql].append(params)
-    for sql, param_list in grouped.items():
-        execute_batch(cur, sql, param_list, page_size=500)
+        try:
+            cur.execute(sql, params)
+        except Exception as e:
+            log.error(f"Single insert failed: {e}")
+            log.error(f"SQL: {sql}")
+            log.error(f"Params: {params}")
+            raise
+    
     conn.commit()
 
 
@@ -1243,8 +1286,17 @@ for i, row in enumerate(df.itertuples(index=False)):
 
     hs_score   = half_space.score_one({"value": price_return})
     half_space.learn_one({"value": price_return})
-    hs_anomaly = hs_score > HST_THRESHOLD or crisis_state["active"]
-
+    # hs_anomaly = hs_score > HST_THRESHOLD or crisis_state["active"]
+    if not hst_calibrated:
+        hst_calib_scores.append(hs_score)
+        hs_anomaly = False
+        if len(hst_calib_scores) >= HST_CALIB_LEN:
+            HST_THRESHOLD = float(np.percentile(hst_calib_scores, 99))
+            hst_calibrated = True
+            log.info("HST calibrated at tick %d: threshold=%.4f (was 0.6000)",
+                    total_ticks, HST_THRESHOLD)
+    else:
+        hs_anomaly = hs_score > HST_THRESHOLD or crisis_state["active"]
     votes            = sum([cusum_anomaly, iso_anomaly, hs_anomaly])
     # Settling window: suppress ensemble voting for a short period after a
     # REGIME_SHIFT recalibration, letting the freshly recalibrated baseline

@@ -9,8 +9,8 @@ conn = psycopg2.connect(
     dbname=os.getenv("TIMESCALE_DB"),
 )
 cur = conn.cursor()
-cur.execute("DELETE FROM anomaly_alerts;")
-cur.execute("DELETE FROM drift_events;")
+cur.execute("DELETE FROM anomaly_alerts WHERE time >= '2022-05-19' AND time < '2022-05-20';")
+cur.execute("DELETE FROM drift_events WHERE time >= '2022-05-19' AND time < '2022-05-20';")
 conn.commit()
 print("All data cleared")
 conn.close()

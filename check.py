@@ -29,8 +29,8 @@
 # for row in cur.fetchall():
 #     print(row)
 
-# conn.close()
 
+# =================================================
 import os, psycopg2
 from dotenv import load_dotenv
 load_dotenv()
@@ -42,14 +42,16 @@ conn = psycopg2.connect(
     dbname=os.getenv("TIMESCALE_DB"),
 )
 cur = conn.cursor()
-cur.execute("""
-    SELECT detector, count(*) FILTER (WHERE is_anomaly) AS flags, count(*) AS total,
-           round(100.0 * count(*) FILTER (WHERE is_anomaly) / count(*), 2) AS pct
-    FROM anomaly_alerts
-    WHERE time BETWEEN '2022-10-01' AND '2022-10-02'
-    GROUP BY detector
-    ORDER BY detector;
-""")
-for row in cur.fetchall():
-    print(row)
+cur.execute("TRUNCATE anomaly_alerts;")
+cur.execute("TRUNCATE drift_events;")
+conn.commit()
+print("Tables truncated")
 conn.close()
+
+# import os
+# from dotenv import load_dotenv
+
+# load_dotenv()
+# csv_path = os.getenv("BACKTEST_CSV_PATH")
+# print(f"Path: {csv_path}")
+# print(f"Exists: {os.path.exists(csv_path) if csv_path else 'None'}")
